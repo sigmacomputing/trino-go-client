@@ -15,16 +15,22 @@
 package trino
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"runtime/debug"
+	"sort"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestConfig(t *testing.T) {
@@ -133,7 +139,7 @@ func TestConnErrorDSN(t *testing.T) {
 			require.NoError(t, err)
 
 			_, err = db.Query("SELECT 1")
-			assert.Errorf(t, err,"test dsn is supposed to fail: %s", tc.DSN)
+			assert.Errorf(t, err, "test dsn is supposed to fail: %s", tc.DSN)
 
 			if err == nil {
 				require.NoError(t, db.Close())
@@ -216,8 +222,11 @@ func TestAuthFailure(t *testing.T) {
 }
 
 func TestQueryForUsername(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping test in short mode.")
+	}
 	c := &Config{
-		ServerURI:         "http://foobar@localhost:8080",
+		ServerURI:         *integrationServerFlag,
 		SessionProperties: map[string]string{"query_priority": "1"},
 	}
 
@@ -233,16 +242,733 @@ func TestQueryForUsername(t *testing.T) {
 
 	rows, err := db.Query("SELECT current_user", sql.Named("X-Trino-User", string("TestUser")))
 	require.NoError(t, err, "Failed executing query")
+	assert.NotNil(t, rows)
 
-	if rows != nil {
-		for rows.Next() {
-			var ts string
-			require.NoError(t, rows.Scan(&ts), "Failed scanning query result")
+	for rows.Next() {
+		var user string
+		require.NoError(t, rows.Scan(&user), "Failed scanning query result")
 
-			want := "TestUser"
-			assert.Equal(t, want, ts, "Expected value does not equal result value")
+		assert.Equal(t, "TestUser", user, "Expected value does not equal result value")
+	}
+}
+
+type TestQueryProgressCallback struct {
+	statusMap map[time.Time]string
+}
+
+func (qpc *TestQueryProgressCallback) Update(qpi QueryProgressInfo) {
+	qpc.statusMap[time.Now()] = qpi.QueryStats.State
+}
+
+func TestQueryProgressWithCallback(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping test in short mode.")
+	}
+	c := &Config{
+		ServerURI:         *integrationServerFlag,
+		SessionProperties: map[string]string{"query_priority": "1"},
+	}
+
+	dsn, err := c.FormatDSN()
+	require.NoError(t, err)
+
+	db, err := sql.Open("trino", dsn)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		assert.NoError(t, db.Close())
+	})
+
+	callback := &TestQueryProgressCallback{}
+
+	_, err = db.Query("SELECT 2", sql.Named("X-Trino-Progress-Callback", callback))
+	assert.EqualError(t, err, ErrInvalidProgressCallbackHeader.Error(), "unexpected error")
+}
+
+func TestQueryProgressWithCallbackPeriod(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping test in short mode.")
+	}
+	c := &Config{
+		ServerURI:         *integrationServerFlag,
+		SessionProperties: map[string]string{"query_priority": "1"},
+	}
+
+	dsn, err := c.FormatDSN()
+	require.NoError(t, err)
+
+	db, err := sql.Open("trino", dsn)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		assert.NoError(t, db.Close())
+	})
+
+	statusMap := make(map[time.Time]string)
+	progressUpdater := &TestQueryProgressCallback{
+		statusMap: statusMap,
+	}
+	progressUpdaterPeriod, err := time.ParseDuration("1ms")
+
+	rows, err := db.Query("SELECT 2",
+		sql.Named("X-Trino-Progress-Callback", progressUpdater),
+		sql.Named("X-Trino-Progress-Callback-Period", progressUpdaterPeriod),
+	)
+	require.NoError(t, err, "Failed executing query")
+	assert.NotNil(t, rows)
+
+	for rows.Next() {
+		var ts string
+		require.NoError(t, rows.Scan(&ts), "Failed scanning query result")
+
+		assert.Equal(t, "2", ts, "Expected value does not equal result value")
+	}
+
+	if err = rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err = rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// sort time in order to calculate interval
+	var keys []time.Time
+	for k := range statusMap {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		return keys[i].Before(keys[j])
+	})
+
+	for i, k := range keys {
+		if i > 0 {
+			assert.GreaterOrEqual(t, k.Sub(keys[i-1]), progressUpdaterPeriod)
 		}
 	}
+}
+
+func TestQueryColumns(t *testing.T) {
+	c := &Config{
+		ServerURI:         *integrationServerFlag,
+		SessionProperties: map[string]string{"query_priority": "1"},
+	}
+
+	dsn, err := c.FormatDSN()
+	require.NoError(t, err)
+
+	db, err := sql.Open("trino", dsn)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		assert.NoError(t, db.Close())
+	})
+
+	rows, err := db.Query(`SELECT
+  true AS bool,
+  cast(123 AS tinyint) AS tinyint,
+  cast(456 AS smallint) AS smallint,
+  cast(678 AS integer) AS integer,
+  cast(1234 AS bigint) AS bigint,
+  cast(1.23 AS real) AS real,
+  cast(1.23 AS double) AS double,
+  cast(1.23 as decimal(10,5)) AS decimal,
+  cast('aaa' as varchar) AS vunbounded,
+  cast('bbb' as varchar(10)) AS vbounded,
+  cast('ccc' AS char) AS cunbounded,
+  cast('ddd' as char(10)) AS cbounded,
+  cast('ddd' as varbinary) AS varbinary,
+  cast('{"aaa": 1}' as json) AS json,
+  current_date AS date,
+  cast(current_time as time) AS time,
+  cast(current_time as time(6)) AS timep,
+  cast(current_time as time with time zone) AS timetz,
+  cast(current_time as timestamp) AS ts,
+  cast(current_time as timestamp(6)) AS tsp,
+  cast(current_time as timestamp with time zone) AS tstz,
+  cast(current_time as timestamp(6) with time zone) AS tsptz,
+  interval '3' month AS ytm,
+  interval '2' day AS dts,
+  array['a', 'b'] AS varray,
+  array[array['a'], array['b']] AS v2array,
+  array[array[array['a'], array['b']]] AS v3array,
+  map(array['a'], array[1]) AS map,
+  array[map(array['a'], array[1]), map(array['b'], array[2])] AS marray,
+  row('a', 1) AS row,
+  cast(row('a', 1.23) AS row(x varchar, y double)) AS named_row,
+  ipaddress '10.0.0.1' AS ip,
+  uuid '12151fd2-7586-11e9-8f9e-2a86e4085a59' AS uuid`)
+	require.NoError(t, err, "Failed executing query")
+	assert.NotNil(t, rows)
+
+	columns, err := rows.Columns()
+	require.NoError(t, err, "Failed reading result columns")
+
+	assert.Equal(t, 33, len(columns), "Expected 33 result column")
+	expectedNames := []string{
+		"bool",
+		"tinyint",
+		"smallint",
+		"integer",
+		"bigint",
+		"real",
+		"double",
+		"decimal",
+		"vunbounded",
+		"vbounded",
+		"cunbounded",
+		"cbounded",
+		"varbinary",
+		"json",
+		"date",
+		"time",
+		"timep",
+		"timetz",
+		"ts",
+		"tsp",
+		"tstz",
+		"tsptz",
+		"ytm",
+		"dts",
+		"varray",
+		"v2array",
+		"v3array",
+		"map",
+		"marray",
+		"row",
+		"named_row",
+		"ip",
+		"uuid",
+	}
+	assert.Equal(t, expectedNames, columns)
+
+	columnTypes, err := rows.ColumnTypes()
+	require.NoError(t, err, "Failed reading result column types")
+
+	assert.Equal(t, 33, len(columnTypes), "Expected 33 result column type")
+
+	type columnType struct {
+		typeName  string
+		hasScale  bool
+		precision int64
+		scale     int64
+		hasLength bool
+		length    int64
+		scanType  reflect.Type
+	}
+	expectedTypes := []columnType{
+		{
+			"BOOLEAN",
+			false,
+			0,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullBool{}),
+		},
+		{
+			"TINYINT",
+			false,
+			0,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullInt32{}),
+		},
+		{
+			"SMALLINT",
+			false,
+			0,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullInt32{}),
+		},
+		{
+			"INTEGER",
+			false,
+			0,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullInt32{}),
+		},
+		{
+			"BIGINT",
+			false,
+			0,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullInt64{}),
+		},
+		{
+			"REAL",
+			false,
+			0,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullFloat64{}),
+		},
+		{
+			"DOUBLE",
+			false,
+			0,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullFloat64{}),
+		},
+		{
+			"DECIMAL",
+			true,
+			10,
+			5,
+			false,
+			0,
+			reflect.TypeOf(sql.NullString{}),
+		},
+		{
+			"VARCHAR",
+			false,
+			0,
+			0,
+			true,
+			math.MaxInt32,
+			reflect.TypeOf(sql.NullString{}),
+		},
+		{
+			"VARCHAR",
+			false,
+			0,
+			0,
+			true,
+			10,
+			reflect.TypeOf(sql.NullString{}),
+		},
+		{
+			"CHAR",
+			false,
+			0,
+			0,
+			true,
+			1,
+			reflect.TypeOf(sql.NullString{}),
+		},
+		{
+			"CHAR",
+			false,
+			0,
+			0,
+			true,
+			10,
+			reflect.TypeOf(sql.NullString{}),
+		},
+		{
+			"VARBINARY",
+			false,
+			0,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullString{}),
+		},
+		{
+			"JSON",
+			false,
+			0,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullString{}),
+		},
+		{
+			"DATE",
+			false,
+			0,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullTime{}),
+		},
+		{
+			"TIME",
+			true,
+			3,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullTime{}),
+		},
+		{
+			"TIME",
+			true,
+			6,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullTime{}),
+		},
+		{
+			"TIME WITH TIME ZONE",
+			true,
+			3,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullTime{}),
+		},
+		{
+			"TIMESTAMP",
+			true,
+			3,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullTime{}),
+		},
+		{
+			"TIMESTAMP",
+			true,
+			6,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullTime{}),
+		},
+		{
+			"TIMESTAMP WITH TIME ZONE",
+			true,
+			3,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullTime{}),
+		},
+		{
+			"TIMESTAMP WITH TIME ZONE",
+			true,
+			6,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullTime{}),
+		},
+		{
+			"INTERVAL YEAR TO MONTH",
+			false,
+			0,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullString{}),
+		},
+		{
+			"INTERVAL DAY TO SECOND",
+			false,
+			0,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullString{}),
+		},
+		{
+			"ARRAY(VARCHAR(1))",
+			false,
+			0,
+			0,
+			false,
+			0,
+			reflect.TypeOf(NullSliceString{}),
+		},
+		{
+			"ARRAY(ARRAY(VARCHAR(1)))",
+			false,
+			0,
+			0,
+			false,
+			0,
+			reflect.TypeOf(NullSlice2String{}),
+		},
+		{
+			"ARRAY(ARRAY(ARRAY(VARCHAR(1))))",
+			false,
+			0,
+			0,
+			false,
+			0,
+			reflect.TypeOf(NullSlice3String{}),
+		},
+		{
+			"MAP(VARCHAR(1), INTEGER)",
+			false,
+			0,
+			0,
+			false,
+			0,
+			reflect.TypeOf(NullMap{}),
+		},
+		{
+			"ARRAY(MAP(VARCHAR(1), INTEGER))",
+			false,
+			0,
+			0,
+			false,
+			0,
+			reflect.TypeOf(NullSliceMap{}),
+		},
+		{
+			"ROW(VARCHAR(1), INTEGER)",
+			false,
+			0,
+			0,
+			false,
+			0,
+			reflect.TypeOf(new(interface{})).Elem(),
+		},
+		{
+			"ROW(X VARCHAR, Y DOUBLE)",
+			false,
+			0,
+			0,
+			false,
+			0,
+			reflect.TypeOf(new(interface{})).Elem(),
+		},
+		{
+			"IPADDRESS",
+			false,
+			0,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullString{}),
+		},
+		{
+			"UUID",
+			false,
+			0,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullString{}),
+		},
+	}
+	actualTypes := make([]columnType, 33)
+	for i, column := range columnTypes {
+		actualTypes[i].typeName = column.DatabaseTypeName()
+		actualTypes[i].precision, actualTypes[i].scale, actualTypes[i].hasScale = column.DecimalSize()
+		actualTypes[i].length, actualTypes[i].hasLength = column.Length()
+		actualTypes[i].scanType = column.ScanType()
+	}
+
+	assert.Equal(t, actualTypes, expectedTypes)
+}
+
+func TestMaxTrinoPrecisionDateTime(t *testing.T) {
+	c := &Config{
+		ServerURI:         *integrationServerFlag,
+		SessionProperties: map[string]string{"query_priority": "1"},
+	}
+
+	dsn, err := c.FormatDSN()
+	require.NoError(t, err)
+
+	db, err := sql.Open("trino", dsn)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		assert.NoError(t, db.Close())
+	})
+
+	rows, err := db.Query(`SELECT
+  TIME '15:55:23.383345123456' AS timep,
+  TIME '15:55:23.383345123456 +08:00' AS timeptz,
+  TIMESTAMP '2020-06-10 15:55:23.383345123456' AS tsp,
+  TIMESTAMP '2020-06-10 15:55:23.383345123456 UTC' AS tsptz`)
+	require.NoError(t, err, "Failed executing query")
+	assert.NotNil(t, rows)
+
+	columns, err := rows.Columns()
+	require.NoError(t, err, "Failed reading result columns")
+
+	assert.Equal(t, 4, len(columns), "Expected 4 result column")
+	expectedNames := []string{
+		"timep",
+		"timeptz",
+		"tsp",
+		"tsptz",
+	}
+	assert.Equal(t, expectedNames, columns)
+
+	columnTypes, err := rows.ColumnTypes()
+	require.NoError(t, err, "Failed reading result column types")
+
+	assert.Equal(t, 4, len(columnTypes), "Expected 4 result column type")
+
+	type columnType struct {
+		typeName  string
+		hasScale  bool
+		precision int64
+		scale     int64
+		hasLength bool
+		length    int64
+		scanType  reflect.Type
+	}
+	expectedTypes := []columnType{
+		{
+			"TIME",
+			true,
+			12,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullTime{}),
+		},
+		{
+			"TIME WITH TIME ZONE",
+			true,
+			12,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullTime{}),
+		},
+		{
+			"TIMESTAMP",
+			true,
+			12,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullTime{}),
+		},
+		{
+			"TIMESTAMP WITH TIME ZONE",
+			true,
+			12,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullTime{}),
+		},
+	}
+	actualTypes := make([]columnType, 4)
+	for i, column := range columnTypes {
+		actualTypes[i].typeName = column.DatabaseTypeName()
+		actualTypes[i].precision, actualTypes[i].scale, actualTypes[i].hasScale = column.DecimalSize()
+		actualTypes[i].length, actualTypes[i].hasLength = column.Length()
+		actualTypes[i].scanType = column.ScanType()
+	}
+
+	assert.Equal(t, actualTypes, expectedTypes)
+
+	assert.False(t, rows.Next())
+	assert.Equal(t, "parsing time \"15:55:23.383345123456\" as \"2006-01-02 15:04:05.999999999\": cannot parse \"5:23.383345123456\" as \"2006\"", rows.Err().Error())
+
+}
+
+func TestMaxGoPrecisionDateTime(t *testing.T) {
+	c := &Config{
+		ServerURI:         *integrationServerFlag,
+		SessionProperties: map[string]string{"query_priority": "1"},
+	}
+
+	dsn, err := c.FormatDSN()
+	require.NoError(t, err)
+
+	db, err := sql.Open("trino", dsn)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		assert.NoError(t, db.Close())
+	})
+
+	rows, err := db.Query(`SELECT
+  cast(current_time as time(9)) AS timep,
+  cast(current_time as time(9) with time zone) AS timeptz,
+  cast(current_time as timestamp(9)) AS tsp,
+  cast(current_time as timestamp(9) with time zone) AS tsptz`)
+	require.NoError(t, err, "Failed executing query")
+	assert.NotNil(t, rows)
+
+	columns, err := rows.Columns()
+	require.NoError(t, err, "Failed reading result columns")
+
+	assert.Equal(t, 4, len(columns), "Expected 4 result column")
+	expectedNames := []string{
+		"timep",
+		"timeptz",
+		"tsp",
+		"tsptz",
+	}
+	assert.Equal(t, expectedNames, columns)
+
+	columnTypes, err := rows.ColumnTypes()
+	require.NoError(t, err, "Failed reading result column types")
+
+	assert.Equal(t, 4, len(columnTypes), "Expected 4 result column type")
+
+	type columnType struct {
+		typeName  string
+		hasScale  bool
+		precision int64
+		scale     int64
+		hasLength bool
+		length    int64
+		scanType  reflect.Type
+	}
+	expectedTypes := []columnType{
+		{
+			"TIME",
+			true,
+			9,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullTime{}),
+		},
+		{
+			"TIME WITH TIME ZONE",
+			true,
+			9,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullTime{}),
+		},
+		{
+			"TIMESTAMP",
+			true,
+			9,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullTime{}),
+		},
+		{
+			"TIMESTAMP WITH TIME ZONE",
+			true,
+			9,
+			0,
+			false,
+			0,
+			reflect.TypeOf(sql.NullTime{}),
+		},
+	}
+	actualTypes := make([]columnType, 4)
+	for i, column := range columnTypes {
+		actualTypes[i].typeName = column.DatabaseTypeName()
+		actualTypes[i].precision, actualTypes[i].scale, actualTypes[i].hasScale = column.DecimalSize()
+		actualTypes[i].length, actualTypes[i].hasLength = column.Length()
+		actualTypes[i].scanType = column.ScanType()
+	}
+
+	assert.Equal(t, actualTypes, expectedTypes)
+
+	assert.True(t, rows.Next())
+	require.NoError(t, rows.Err())
+
 }
 
 func TestQueryCancellation(t *testing.T) {
@@ -284,6 +1010,98 @@ func TestQueryFailure(t *testing.T) {
 
 	_, err = db.Query("SELECT 1")
 	assert.IsTypef(t, new(ErrQueryFailed), err, "unexpected error: %w", err)
+}
+
+// This test ensures that the fetch method is not generating stack overflow errors.
+// === RUN   TestFetchNoStackOverflow
+// runtime: goroutine stack exceeds 1000000000-byte limit
+// runtime: sp=0x14037b00390 stack=[0x14037b00000, 0x14057b00000]
+// fatal error: stack overflow
+func TestFetchNoStackOverflow(t *testing.T) {
+	previousSetting := debug.SetMaxStack(50 * 1024)
+	defer debug.SetMaxStack(previousSetting)
+	count := 0
+	var buf *bytes.Buffer
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if count <= 50 {
+			if buf == nil {
+				buf = new(bytes.Buffer)
+				json.NewEncoder(buf).Encode(&stmtResponse{
+					ID:      "fake-query",
+					NextURI: ts.URL + "/v1/statement/20210817_140827_00000_arvdv/1",
+				})
+			}
+			w.WriteHeader(http.StatusOK)
+			w.Write(buf.Bytes())
+			count++
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(&stmtResponse{
+			Error: stmtError{
+				ErrorName: "TEST",
+			},
+		})
+	}))
+
+	db, err := sql.Open("trino", ts.URL)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		assert.NoError(t, db.Close())
+	})
+
+	_, err = db.Query("SELECT 1")
+	assert.IsTypef(t, new(ErrQueryFailed), err, "unexpected error: %w", err)
+
+}
+
+func TestSession(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping test in short mode.")
+	}
+	err := RegisterCustomClient("uncompressed", &http.Client{Transport: &http.Transport{DisableCompression: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Config{
+		ServerURI:         *integrationServerFlag + "?custom_client=uncompressed",
+		SessionProperties: map[string]string{"query_priority": "1"},
+	}
+
+	dsn, err := c.FormatDSN()
+	require.NoError(t, err)
+
+	db, err := sql.Open("trino", dsn)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		assert.NoError(t, db.Close())
+	})
+
+	_, err = db.Exec("SET SESSION join_distribution_type='BROADCAST'")
+	require.NoError(t, err, "Failed executing query")
+
+	row := db.QueryRow("SHOW SESSION LIKE 'join_distribution_type'")
+	var name string
+	var value string
+	var defaultValue string
+	var typeName string
+	var description string
+	err = row.Scan(&name, &value, &defaultValue, &typeName, &description)
+	require.NoError(t, err, "Failed executing query")
+
+	assert.Equal(t, "BROADCAST", value)
+
+	_, err = db.Exec("RESET SESSION join_distribution_type")
+	require.NoError(t, err, "Failed executing query")
+
+	row = db.QueryRow("SHOW SESSION LIKE 'join_distribution_type'")
+	err = row.Scan(&name, &value, &defaultValue, &typeName, &description)
+	require.NoError(t, err, "Failed executing query")
+
+	assert.Equal(t, "AUTOMATIC", value)
 }
 
 func TestUnsupportedHeader(t *testing.T) {
@@ -348,72 +1166,319 @@ func TestUnsupportedTransaction(t *testing.T) {
 func TestTypeConversion(t *testing.T) {
 	utc, err := time.LoadLocation("UTC")
 	require.NoError(t, err)
+	paris, err := time.LoadLocation("Europe/Paris")
+	require.NoError(t, err)
 
 	testcases := []struct {
 		DataType                   string
+		RawType                    string
+		Arguments                  []typeArgument
 		ResponseUnmarshalledSample interface{}
 		ExpectedGoValue            interface{}
 	}{
 		{
 			DataType:                   "boolean",
+			RawType:                    "boolean",
 			ResponseUnmarshalledSample: true,
 			ExpectedGoValue:            true,
 		},
 		{
 			DataType:                   "varchar(1)",
+			RawType:                    "varchar",
 			ResponseUnmarshalledSample: "hello",
 			ExpectedGoValue:            "hello",
 		},
 		{
 			DataType:                   "bigint",
+			RawType:                    "bigint",
 			ResponseUnmarshalledSample: json.Number("1234516165077230279"),
 			ExpectedGoValue:            int64(1234516165077230279),
 		},
 		{
 			DataType:                   "double",
+			RawType:                    "double",
 			ResponseUnmarshalledSample: json.Number("1.0"),
 			ExpectedGoValue:            float64(1),
 		},
 		{
 			DataType:                   "date",
+			RawType:                    "date",
 			ResponseUnmarshalledSample: "2017-07-10",
 			ExpectedGoValue:            time.Date(2017, 7, 10, 0, 0, 0, 0, time.Local),
 		},
 		{
 			DataType:                   "time",
+			RawType:                    "time",
 			ResponseUnmarshalledSample: "01:02:03.000",
 			ExpectedGoValue:            time.Date(0, 1, 1, 1, 2, 3, 0, time.Local),
 		},
 		{
 			DataType:                   "time with time zone",
+			RawType:                    "time with time zone",
 			ResponseUnmarshalledSample: "01:02:03.000 UTC",
 			ExpectedGoValue:            time.Date(0, 1, 1, 1, 2, 3, 0, utc),
 		},
 		{
+			DataType:                   "time with time zone",
+			RawType:                    "time with time zone",
+			ResponseUnmarshalledSample: "01:02:03.000 +03:00",
+			ExpectedGoValue:            time.Date(0, 1, 1, 1, 2, 3, 0, time.FixedZone("", 3*3600)),
+		},
+		{
+			DataType:                   "time with time zone",
+			RawType:                    "time with time zone",
+			ResponseUnmarshalledSample: "01:02:03.000+03:00",
+			ExpectedGoValue:            time.Date(0, 1, 1, 1, 2, 3, 0, time.FixedZone("", 3*3600)),
+		},
+		{
+			DataType:                   "time with time zone",
+			RawType:                    "time with time zone",
+			ResponseUnmarshalledSample: "01:02:03.000 -05:00",
+			ExpectedGoValue:            time.Date(0, 1, 1, 1, 2, 3, 0, time.FixedZone("", -5*3600)),
+		},
+		{
+			DataType:                   "time with time zone",
+			RawType:                    "time with time zone",
+			ResponseUnmarshalledSample: "01:02:03.000-05:00",
+			ExpectedGoValue:            time.Date(0, 1, 1, 1, 2, 3, 0, time.FixedZone("", -5*3600)),
+		},
+		{
+			DataType:                   "time",
+			RawType:                    "time",
+			ResponseUnmarshalledSample: "01:02:03.123456789",
+			ExpectedGoValue:            time.Date(0, 1, 1, 1, 2, 3, 123456789, time.Local),
+		},
+		{
+			DataType:                   "time with time zone",
+			RawType:                    "time with time zone",
+			ResponseUnmarshalledSample: "01:02:03.123456789 UTC",
+			ExpectedGoValue:            time.Date(0, 1, 1, 1, 2, 3, 123456789, utc),
+		},
+		{
+			DataType:                   "time with time zone",
+			RawType:                    "time with time zone",
+			ResponseUnmarshalledSample: "01:02:03.123456789 +03:00",
+			ExpectedGoValue:            time.Date(0, 1, 1, 1, 2, 3, 123456789, time.FixedZone("", 3*3600)),
+		},
+		{
+			DataType:                   "time with time zone",
+			RawType:                    "time with time zone",
+			ResponseUnmarshalledSample: "01:02:03.123456789+03:00",
+			ExpectedGoValue:            time.Date(0, 1, 1, 1, 2, 3, 123456789, time.FixedZone("", 3*3600)),
+		},
+		{
+			DataType:                   "time with time zone",
+			RawType:                    "time with time zone",
+			ResponseUnmarshalledSample: "01:02:03.123456789 -05:00",
+			ExpectedGoValue:            time.Date(0, 1, 1, 1, 2, 3, 123456789, time.FixedZone("", -5*3600)),
+		},
+		{
+			DataType:                   "time with time zone",
+			RawType:                    "time with time zone",
+			ResponseUnmarshalledSample: "01:02:03.123456789-05:00",
+			ExpectedGoValue:            time.Date(0, 1, 1, 1, 2, 3, 123456789, time.FixedZone("", -5*3600)),
+		},
+		{
+			DataType:                   "time with time zone",
+			RawType:                    "time with time zone",
+			ResponseUnmarshalledSample: "01:02:03.123456789 Europe/Paris",
+			ExpectedGoValue:            time.Date(0, 1, 1, 1, 2, 3, 123456789, paris),
+		},
+		{
 			DataType:                   "timestamp",
+			RawType:                    "timestamp",
 			ResponseUnmarshalledSample: "2017-07-10 01:02:03.000",
 			ExpectedGoValue:            time.Date(2017, 7, 10, 1, 2, 3, 0, time.Local),
 		},
 		{
 			DataType:                   "timestamp with time zone",
+			RawType:                    "timestamp with time zone",
 			ResponseUnmarshalledSample: "2017-07-10 01:02:03.000 UTC",
 			ExpectedGoValue:            time.Date(2017, 7, 10, 1, 2, 3, 0, utc),
 		},
 		{
-			DataType:                   "map",
+			DataType:                   "timestamp with time zone",
+			RawType:                    "timestamp with time zone",
+			ResponseUnmarshalledSample: "2017-07-10 01:02:03.000 +03:00",
+			ExpectedGoValue:            time.Date(2017, 7, 10, 1, 2, 3, 0, time.FixedZone("", 3*3600)),
+		},
+		{
+			DataType:                   "timestamp with time zone",
+			RawType:                    "timestamp with time zone",
+			ResponseUnmarshalledSample: "2017-07-10 01:02:03.000+03:00",
+			ExpectedGoValue:            time.Date(2017, 7, 10, 1, 2, 3, 0, time.FixedZone("", 3*3600)),
+		},
+		{
+			DataType:                   "timestamp with time zone",
+			RawType:                    "timestamp with time zone",
+			ResponseUnmarshalledSample: "2017-07-10 01:02:03.000 -04:00",
+			ExpectedGoValue:            time.Date(2017, 7, 10, 1, 2, 3, 0, time.FixedZone("", -4*3600)),
+		},
+		{
+			DataType:                   "timestamp with time zone",
+			RawType:                    "timestamp with time zone",
+			ResponseUnmarshalledSample: "2017-07-10 01:02:03.000-04:00",
+			ExpectedGoValue:            time.Date(2017, 7, 10, 1, 2, 3, 0, time.FixedZone("", -4*3600)),
+		},
+		{
+			DataType:                   "timestamp",
+			RawType:                    "timestamp",
+			ResponseUnmarshalledSample: "2017-07-10 01:02:03.123456789",
+			ExpectedGoValue:            time.Date(2017, 7, 10, 1, 2, 3, 123456789, time.Local),
+		},
+		{
+			DataType:                   "timestamp with time zone",
+			RawType:                    "timestamp with time zone",
+			ResponseUnmarshalledSample: "2017-07-10 01:02:03.123456789 UTC",
+			ExpectedGoValue:            time.Date(2017, 7, 10, 1, 2, 3, 123456789, utc),
+		},
+		{
+			DataType:                   "timestamp with time zone",
+			RawType:                    "timestamp with time zone",
+			ResponseUnmarshalledSample: "2017-07-10 01:02:03.123456789 +03:00",
+			ExpectedGoValue:            time.Date(2017, 7, 10, 1, 2, 3, 123456789, time.FixedZone("", 3*3600)),
+		},
+		{
+			DataType:                   "timestamp with time zone",
+			RawType:                    "timestamp with time zone",
+			ResponseUnmarshalledSample: "2017-07-10 01:02:03.123456789+03:00",
+			ExpectedGoValue:            time.Date(2017, 7, 10, 1, 2, 3, 123456789, time.FixedZone("", 3*3600)),
+		},
+		{
+			DataType:                   "timestamp with time zone",
+			RawType:                    "timestamp with time zone",
+			ResponseUnmarshalledSample: "2017-07-10 01:02:03.123456789 -04:00",
+			ExpectedGoValue:            time.Date(2017, 7, 10, 1, 2, 3, 123456789, time.FixedZone("", -4*3600)),
+		},
+		{
+			DataType:                   "timestamp with time zone",
+			RawType:                    "timestamp with time zone",
+			ResponseUnmarshalledSample: "2017-07-10 01:02:03.123456789-04:00",
+			ExpectedGoValue:            time.Date(2017, 7, 10, 1, 2, 3, 123456789, time.FixedZone("", -4*3600)),
+		},
+		{
+			DataType:                   "timestamp with time zone",
+			RawType:                    "timestamp with time zone",
+			ResponseUnmarshalledSample: "2017-07-10 01:02:03.123456789 Europe/Paris",
+			ExpectedGoValue:            time.Date(2017, 7, 10, 1, 2, 3, 123456789, paris),
+		},
+		{
+			DataType: "map(varchar,varchar)",
+			RawType:  "map",
+			Arguments: []typeArgument{
+				{
+					Kind: "NAMED_TYPE",
+					namedTypeSignature: namedTypeSignature{
+						TypeSignature: typeSignature{
+							RawType: "varchar",
+						},
+					},
+				},
+				{
+					Kind: "NAMED_TYPE",
+					namedTypeSignature: namedTypeSignature{
+						TypeSignature: typeSignature{
+							RawType: "varchar",
+						},
+					},
+				},
+			},
 			ResponseUnmarshalledSample: nil,
 			ExpectedGoValue:            nil,
 		},
 		{
 			// arrays return data as-is for slice scanners
-			DataType:                   "array",
+			DataType: "array(varchar)",
+			RawType:  "array",
+			Arguments: []typeArgument{
+				{
+					Kind: "NAMED_TYPE",
+					namedTypeSignature: namedTypeSignature{
+						TypeSignature: typeSignature{
+							RawType: "varchar",
+						},
+					},
+				},
+			},
 			ResponseUnmarshalledSample: nil,
 			ExpectedGoValue:            nil,
+		},
+		{
+			// rows return data as-is for slice scanners
+			DataType: "row(int, varchar(1), timestamp, array(varchar(1)))",
+			RawType:  "row",
+			Arguments: []typeArgument{
+				{
+					Kind: "NAMED_TYPE",
+					namedTypeSignature: namedTypeSignature{
+						TypeSignature: typeSignature{
+							RawType: "integer",
+						},
+					},
+				},
+				{
+					Kind: "NAMED_TYPE",
+					namedTypeSignature: namedTypeSignature{
+						TypeSignature: typeSignature{
+							RawType: "varchar",
+							Arguments: []typeArgument{
+								{
+									Kind: "LONG",
+									long: 1,
+								},
+							},
+						},
+					},
+				},
+				{
+					Kind: "NAMED_TYPE",
+					namedTypeSignature: namedTypeSignature{
+						TypeSignature: typeSignature{
+							RawType: "timestamp",
+						},
+					},
+				},
+				{
+					Kind: "NAMED_TYPE",
+					namedTypeSignature: namedTypeSignature{
+						TypeSignature: typeSignature{
+							RawType: "array",
+							Arguments: []typeArgument{
+								{
+									Kind: "TYPE",
+									typeSignature: typeSignature{
+										RawType: "varchar",
+										Arguments: []typeArgument{
+											{
+												Kind: "LONG",
+												long: 1,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			ResponseUnmarshalledSample: []interface{}{
+				json.Number("1"),
+				"a",
+				"2017-07-10 01:02:03.000 UTC",
+				[]interface{}{"b"},
+			},
+			ExpectedGoValue: []interface{}{
+				json.Number("1"),
+				"a",
+				"2017-07-10 01:02:03.000 UTC",
+				[]interface{}{"b"},
+			},
 		},
 	}
 
 	for _, tc := range testcases {
-		converter := newTypeConverter(tc.DataType)
+		converter, err := newTypeConverter(tc.DataType, typeSignature{RawType: tc.RawType, Arguments: tc.Arguments})
+		assert.NoError(t, err)
 
 		t.Run(tc.DataType+":nil", func(t *testing.T) {
 			_, err := converter.ConvertValue(nil)
@@ -441,33 +1506,33 @@ func TestSliceTypeConversion(t *testing.T) {
 		GoType                          string
 		Scanner                         sql.Scanner
 		TrinoResponseUnmarshalledSample interface{}
-		TestScanner                     func(t *testing.T, s sql.Scanner)
+		TestScanner                     func(t *testing.T, s sql.Scanner, isValid bool)
 	}{
 		{
 			GoType:                          "[]bool",
 			Scanner:                         &NullSliceBool{},
 			TrinoResponseUnmarshalledSample: []interface{}{true},
-			TestScanner: func(t *testing.T, s sql.Scanner) {
+			TestScanner: func(t *testing.T, s sql.Scanner, isValid bool) {
 				v, _ := s.(*NullSliceBool)
-				assert.True(t, v.Valid, "scanner failed")
+				assert.Equal(t, isValid, v.Valid, "scanner failed")
 			},
 		},
 		{
 			GoType:                          "[]string",
 			Scanner:                         &NullSliceString{},
 			TrinoResponseUnmarshalledSample: []interface{}{"hello"},
-			TestScanner: func(t *testing.T, s sql.Scanner) {
+			TestScanner: func(t *testing.T, s sql.Scanner, isValid bool) {
 				v, _ := s.(*NullSliceString)
-				assert.True(t, v.Valid, "scanner failed")
+				assert.Equal(t, isValid, v.Valid, "scanner failed")
 			},
 		},
 		{
 			GoType:                          "[]int64",
 			Scanner:                         &NullSliceInt64{},
 			TrinoResponseUnmarshalledSample: []interface{}{json.Number("1")},
-			TestScanner: func(t *testing.T, s sql.Scanner) {
+			TestScanner: func(t *testing.T, s sql.Scanner, isValid bool) {
 				v, _ := s.(*NullSliceInt64)
-				assert.True(t, v.Valid, "scanner failed")
+				assert.Equal(t, isValid, v.Valid, "scanner failed")
 			},
 		},
 
@@ -475,27 +1540,27 @@ func TestSliceTypeConversion(t *testing.T) {
 			GoType:                          "[]float64",
 			Scanner:                         &NullSliceFloat64{},
 			TrinoResponseUnmarshalledSample: []interface{}{json.Number("1.0")},
-			TestScanner: func(t *testing.T, s sql.Scanner) {
+			TestScanner: func(t *testing.T, s sql.Scanner, isValid bool) {
 				v, _ := s.(*NullSliceFloat64)
-				assert.True(t, v.Valid, "scanner failed")
+				assert.Equal(t, isValid, v.Valid, "scanner failed")
 			},
 		},
 		{
 			GoType:                          "[]time.Time",
 			Scanner:                         &NullSliceTime{},
 			TrinoResponseUnmarshalledSample: []interface{}{"2017-07-01"},
-			TestScanner: func(t *testing.T, s sql.Scanner) {
+			TestScanner: func(t *testing.T, s sql.Scanner, isValid bool) {
 				v, _ := s.(*NullSliceTime)
-				assert.True(t, v.Valid, "scanner failed")
+				assert.Equal(t, isValid, v.Valid, "scanner failed")
 			},
 		},
 		{
 			GoType:                          "[]map[string]interface{}",
 			Scanner:                         &NullSliceMap{},
 			TrinoResponseUnmarshalledSample: []interface{}{map[string]interface{}{"hello": "world"}},
-			TestScanner: func(t *testing.T, s sql.Scanner) {
+			TestScanner: func(t *testing.T, s sql.Scanner, isValid bool) {
 				v, _ := s.(*NullSliceMap)
-				assert.True(t, v.Valid, "scanner failed")
+				assert.Equal(t, isValid, v.Valid, "scanner failed")
 			},
 		},
 	}
@@ -511,7 +1576,9 @@ func TestSliceTypeConversion(t *testing.T) {
 
 		t.Run(tc.GoType+":sample", func(t *testing.T) {
 			require.NoError(t, tc.Scanner.Scan(tc.TrinoResponseUnmarshalledSample))
-			tc.TestScanner(t, tc.Scanner)
+			tc.TestScanner(t, tc.Scanner, true)
+			require.NoError(t, tc.Scanner.Scan(nil))
+			tc.TestScanner(t, tc.Scanner, false)
 		})
 	}
 }
@@ -521,60 +1588,60 @@ func TestSlice2TypeConversion(t *testing.T) {
 		GoType                          string
 		Scanner                         sql.Scanner
 		TrinoResponseUnmarshalledSample interface{}
-		TestScanner                     func(t *testing.T, s sql.Scanner)
+		TestScanner                     func(t *testing.T, s sql.Scanner, isValid bool)
 	}{
 		{
 			GoType:                          "[][]bool",
 			Scanner:                         &NullSlice2Bool{},
 			TrinoResponseUnmarshalledSample: []interface{}{[]interface{}{true}},
-			TestScanner: func(t *testing.T, s sql.Scanner) {
+			TestScanner: func(t *testing.T, s sql.Scanner, isValid bool) {
 				v, _ := s.(*NullSlice2Bool)
-				assert.True(t, v.Valid, "scanner failed")
+				assert.Equal(t, isValid, v.Valid, "scanner failed")
 			},
 		},
 		{
 			GoType:                          "[][]string",
 			Scanner:                         &NullSlice2String{},
 			TrinoResponseUnmarshalledSample: []interface{}{[]interface{}{"hello"}},
-			TestScanner: func(t *testing.T, s sql.Scanner) {
+			TestScanner: func(t *testing.T, s sql.Scanner, isValid bool) {
 				v, _ := s.(*NullSlice2String)
-				assert.True(t, v.Valid, "scanner failed")
+				assert.Equal(t, isValid, v.Valid, "scanner failed")
 			},
 		},
 		{
 			GoType:                          "[][]int64",
 			Scanner:                         &NullSlice2Int64{},
 			TrinoResponseUnmarshalledSample: []interface{}{[]interface{}{json.Number("1")}},
-			TestScanner: func(t *testing.T, s sql.Scanner) {
+			TestScanner: func(t *testing.T, s sql.Scanner, isValid bool) {
 				v, _ := s.(*NullSlice2Int64)
-				assert.True(t, v.Valid, "scanner failed")
+				assert.Equal(t, isValid, v.Valid, "scanner failed")
 			},
 		},
 		{
 			GoType:                          "[][]float64",
 			Scanner:                         &NullSlice2Float64{},
 			TrinoResponseUnmarshalledSample: []interface{}{[]interface{}{json.Number("1.0")}},
-			TestScanner: func(t *testing.T, s sql.Scanner) {
+			TestScanner: func(t *testing.T, s sql.Scanner, isValid bool) {
 				v, _ := s.(*NullSlice2Float64)
-				assert.True(t, v.Valid, "scanner failed")
+				assert.Equal(t, isValid, v.Valid, "scanner failed")
 			},
 		},
 		{
 			GoType:                          "[][]time.Time",
 			Scanner:                         &NullSlice2Time{},
 			TrinoResponseUnmarshalledSample: []interface{}{[]interface{}{"2017-07-01"}},
-			TestScanner: func(t *testing.T, s sql.Scanner) {
+			TestScanner: func(t *testing.T, s sql.Scanner, isValid bool) {
 				v, _ := s.(*NullSlice2Time)
-				assert.True(t, v.Valid, "scanner failed")
+				assert.Equal(t, isValid, v.Valid, "scanner failed")
 			},
 		},
 		{
 			GoType:                          "[][]map[string]interface{}",
 			Scanner:                         &NullSlice2Map{},
 			TrinoResponseUnmarshalledSample: []interface{}{[]interface{}{map[string]interface{}{"hello": "world"}}},
-			TestScanner: func(t *testing.T, s sql.Scanner) {
+			TestScanner: func(t *testing.T, s sql.Scanner, isValid bool) {
 				v, _ := s.(*NullSlice2Map)
-				assert.True(t, v.Valid, "scanner failed")
+				assert.Equal(t, isValid, v.Valid, "scanner failed")
 			},
 		},
 	}
@@ -592,7 +1659,9 @@ func TestSlice2TypeConversion(t *testing.T) {
 
 		t.Run(tc.GoType+":sample", func(t *testing.T) {
 			require.NoError(t, tc.Scanner.Scan(tc.TrinoResponseUnmarshalledSample))
-			tc.TestScanner(t, tc.Scanner)
+			tc.TestScanner(t, tc.Scanner, true)
+			require.NoError(t, tc.Scanner.Scan(nil))
+			tc.TestScanner(t, tc.Scanner, false)
 		})
 	}
 }
@@ -602,60 +1671,60 @@ func TestSlice3TypeConversion(t *testing.T) {
 		GoType                          string
 		Scanner                         sql.Scanner
 		TrinoResponseUnmarshalledSample interface{}
-		TestScanner                     func(t *testing.T, s sql.Scanner)
+		TestScanner                     func(t *testing.T, s sql.Scanner, isValid bool)
 	}{
 		{
 			GoType:                          "[][][]bool",
 			Scanner:                         &NullSlice3Bool{},
 			TrinoResponseUnmarshalledSample: []interface{}{[]interface{}{[]interface{}{true}}},
-			TestScanner: func(t *testing.T, s sql.Scanner) {
+			TestScanner: func(t *testing.T, s sql.Scanner, isValid bool) {
 				v, _ := s.(*NullSlice3Bool)
-				assert.True(t, v.Valid, "scanner failed")
+				assert.Equal(t, isValid, v.Valid, "scanner failed")
 			},
 		},
 		{
 			GoType:                          "[][][]string",
 			Scanner:                         &NullSlice3String{},
 			TrinoResponseUnmarshalledSample: []interface{}{[]interface{}{[]interface{}{"hello"}}},
-			TestScanner: func(t *testing.T, s sql.Scanner) {
+			TestScanner: func(t *testing.T, s sql.Scanner, isValid bool) {
 				v, _ := s.(*NullSlice3String)
-				assert.True(t, v.Valid, "scanner failed")
+				assert.Equal(t, isValid, v.Valid, "scanner failed")
 			},
 		},
 		{
 			GoType:                          "[][][]int64",
 			Scanner:                         &NullSlice3Int64{},
 			TrinoResponseUnmarshalledSample: []interface{}{[]interface{}{[]interface{}{json.Number("1")}}},
-			TestScanner: func(t *testing.T, s sql.Scanner) {
+			TestScanner: func(t *testing.T, s sql.Scanner, isValid bool) {
 				v, _ := s.(*NullSlice3Int64)
-				assert.True(t, v.Valid, "scanner failed")
+				assert.Equal(t, isValid, v.Valid, "scanner failed")
 			},
 		},
 		{
 			GoType:                          "[][][]float64",
 			Scanner:                         &NullSlice3Float64{},
 			TrinoResponseUnmarshalledSample: []interface{}{[]interface{}{[]interface{}{json.Number("1.0")}}},
-			TestScanner: func(t *testing.T, s sql.Scanner) {
+			TestScanner: func(t *testing.T, s sql.Scanner, isValid bool) {
 				v, _ := s.(*NullSlice3Float64)
-				assert.True(t, v.Valid, "scanner failed")
+				assert.Equal(t, isValid, v.Valid, "scanner failed")
 			},
 		},
 		{
 			GoType:                          "[][][]time.Time",
 			Scanner:                         &NullSlice3Time{},
 			TrinoResponseUnmarshalledSample: []interface{}{[]interface{}{[]interface{}{"2017-07-01"}}},
-			TestScanner: func(t *testing.T, s sql.Scanner) {
+			TestScanner: func(t *testing.T, s sql.Scanner, isValid bool) {
 				v, _ := s.(*NullSlice3Time)
-				assert.True(t, v.Valid, "scanner failed")
+				assert.Equal(t, isValid, v.Valid, "scanner failed")
 			},
 		},
 		{
 			GoType:                          "[][][]map[string]interface{}",
 			Scanner:                         &NullSlice3Map{},
 			TrinoResponseUnmarshalledSample: []interface{}{[]interface{}{[]interface{}{map[string]interface{}{"hello": "world"}}}},
-			TestScanner: func(t *testing.T, s sql.Scanner) {
+			TestScanner: func(t *testing.T, s sql.Scanner, isValid bool) {
 				v, _ := s.(*NullSlice3Map)
-				assert.True(t, v.Valid, "scanner failed")
+				assert.Equal(t, isValid, v.Valid, "scanner failed")
 			},
 		},
 	}
@@ -673,7 +1742,35 @@ func TestSlice3TypeConversion(t *testing.T) {
 
 		t.Run(tc.GoType+":sample", func(t *testing.T) {
 			require.NoError(t, tc.Scanner.Scan(tc.TrinoResponseUnmarshalledSample))
-			tc.TestScanner(t, tc.Scanner)
+			tc.TestScanner(t, tc.Scanner, true)
+			require.NoError(t, tc.Scanner.Scan(nil))
+			tc.TestScanner(t, tc.Scanner, false)
 		})
+	}
+}
+
+func BenchmarkQuery(b *testing.B) {
+	c := &Config{
+		ServerURI:         *integrationServerFlag,
+		SessionProperties: map[string]string{"query_priority": "1"},
+	}
+
+	dsn, err := c.FormatDSN()
+	require.NoError(b, err)
+
+	db, err := sql.Open("trino", dsn)
+	require.NoError(b, err)
+
+	b.Cleanup(func() {
+		assert.NoError(b, db.Close())
+	})
+
+	q := `SELECT * FROM tpch.sf1.orders LIMIT 10000000`
+	for n := 0; n < b.N; n++ {
+		rows, err := db.Query(q)
+		require.NoError(b, err)
+		for rows.Next() {
+		}
+		rows.Close()
 	}
 }

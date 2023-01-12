@@ -19,46 +19,103 @@ import (
 	"database/sql"
 	"errors"
 	"flag"
+	"log"
 	"net/http"
 	"os"
 	"strings"
 	"testing"
 	"time"
+
+	dt "github.com/ory/dockertest/v3"
 )
 
 var (
+	pool     *dt.Pool
+	resource *dt.Resource
+
 	integrationServerFlag = flag.String(
 		"trino_server_dsn",
 		os.Getenv("TRINO_SERVER_DSN"),
-		"dsn of the Trino server used for integration tests; default disabled",
+		"dsn of the Trino server used for integration tests instead of starting a Docker container",
 	)
 	integrationServerQueryTimeout = flag.Duration(
 		"trino_query_timeout",
 		5*time.Second,
 		"max duration for Trino queries to run before giving up",
 	)
+	noCleanup = flag.Bool(
+		"no_cleanup",
+		false,
+		"do not delete containers on exit",
+	)
 )
 
-func init() {
-	// explicitly init testing module so flags are registered before call to flag.Parse
-	testing.Init()
+func TestMain(m *testing.M) {
 	flag.Parse()
 	DefaultQueryTimeout = *integrationServerQueryTimeout
 	DefaultCancelQueryTimeout = *integrationServerQueryTimeout
-}
 
-// integrationServerDSN returns the URL of the integration test server.
-func integrationServerDSN(t *testing.T) string {
-	if dsn := *integrationServerFlag; dsn != "" {
-		return dsn
+	var err error
+	if *integrationServerFlag == "" && !testing.Short() {
+		pool, err = dt.NewPool("")
+		if err != nil {
+			log.Fatalf("Could not connect to docker: %s", err)
+		}
+		pool.MaxWait = 1 * time.Minute
+
+		wd, err := os.Getwd()
+		if err != nil {
+			log.Fatalf("Failed to get working directory: %s", err)
+		}
+		name := "trino-go-client-tests"
+		var ok bool
+		resource, ok = pool.ContainerByName(name)
+
+		if !ok {
+			resource, err = pool.RunWithOptions(&dt.RunOptions{
+				Name:       name,
+				Repository: "trinodb/trino",
+				Tag:        "latest",
+				Mounts:     []string{wd + "/etc:/etc/trino"},
+			})
+			if err != nil {
+				log.Fatalf("Could not start resource: %s", err)
+			}
+		}
+
+		if err := pool.Retry(func() error {
+			c, err := pool.Client.InspectContainer(resource.Container.ID)
+			if err != nil {
+				return err
+			}
+			if c.State.Health.Status != "healthy" {
+				return errors.New("Not ready")
+			}
+			return nil
+		}); err != nil {
+			log.Fatalf("Timed out waiting for container to get ready: %s", err)
+		}
+		*integrationServerFlag = "http://test@localhost:" + resource.GetPort("8080/tcp")
 	}
-	t.Skip()
-	return ""
+
+	code := m.Run()
+
+	if !*noCleanup && pool != nil && resource != nil {
+		// You can't defer this because os.Exit doesn't care for defer
+		if err := pool.Purge(resource); err != nil {
+			log.Fatalf("Could not purge resource: %s", err)
+		}
+	}
+
+	os.Exit(code)
 }
 
 // integrationOpen opens a connection to the integration test server.
 func integrationOpen(t *testing.T, dsn ...string) *sql.DB {
-	target := integrationServerDSN(t)
+	if testing.Short() {
+		t.Skip("Skipping test in short mode.")
+	}
+	target := *integrationServerFlag
 	if len(dsn) > 0 {
 		target = dsn[0]
 	}
@@ -71,14 +128,6 @@ func integrationOpen(t *testing.T, dsn ...string) *sql.DB {
 
 // integration tests based on python tests:
 // https://github.com/trinodb/trino-python-client/tree/master/integration_tests
-
-func TestIntegrationEnabled(t *testing.T) {
-	dsn := *integrationServerFlag
-	if dsn == "" {
-		example := "http://test@localhost:8080"
-		t.Skip("integration tests not enabled; use e.g. -trino_server_dsn=" + example)
-	}
-}
 
 type nodesRow struct {
 	NodeID      string
@@ -111,14 +160,14 @@ func TestIntegrationSelectQueryIterator(t *testing.T) {
 			t.Fatal(err)
 		}
 		if col.NodeID != "test" {
-			t.Fatal("node_id != test")
+			t.Errorf("Expected node_id == test but got %s", col.NodeID)
 		}
 	}
 	if err = rows.Err(); err != nil {
 		t.Fatal(err)
 	}
 	if count < 1 {
-		t.Fatal("no rows returned")
+		t.Error("no rows returned")
 	}
 }
 
@@ -244,7 +293,7 @@ handleErr:
 }
 
 func TestIntegrationSessionProperties(t *testing.T) {
-	dsn := integrationServerDSN(t)
+	dsn := *integrationServerFlag
 	dsn += "?session_properties=query_max_run_time=10m,query_priority=2"
 	db := integrationOpen(t, dsn)
 	defer db.Close()
@@ -283,8 +332,12 @@ func TestIntegrationSessionProperties(t *testing.T) {
 }
 
 func TestIntegrationTypeConversion(t *testing.T) {
-	dsn := integrationServerDSN(t)
-	dsn += "?session_properties=parse_decimal_literals_as_double=true"
+	err := RegisterCustomClient("uncompressed", &http.Client{Transport: &http.Transport{DisableCompression: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dsn := *integrationServerFlag
+	dsn += "?session_properties=parse_decimal_literals_as_double=true&custom_client=uncompressed"
 	db := integrationOpen(t, dsn)
 	var (
 		goTime            time.Time
@@ -302,8 +355,9 @@ func TestIntegrationTypeConversion(t *testing.T) {
 		nullFloat64Slice3 NullSlice3Float64
 		goMap             map[string]interface{}
 		nullMap           NullMap
+		goRow             []interface{}
 	)
-	err := db.QueryRow(`
+	err = db.QueryRow(`
 		SELECT
 			TIMESTAMP '2017-07-10 01:02:03.004 UTC',
 			CAST(NULL AS TIMESTAMP),
@@ -319,7 +373,8 @@ func TestIntegrationTypeConversion(t *testing.T) {
 			ARRAY[ARRAY[1.1, 1.1, 1.1], NULL],
 			ARRAY[ARRAY[ARRAY[1.1, 1.1, 1.1], NULL], NULL],
 			MAP(ARRAY['a', 'b'], ARRAY['c', 'd']),
-			CAST(NULL AS MAP(ARRAY(INTEGER), ARRAY(INTEGER)))
+			CAST(NULL AS MAP(ARRAY(INTEGER), ARRAY(INTEGER))),
+			ROW(1, 'a', CAST('2017-07-10 01:02:03.004 UTC' AS TIMESTAMP(6) WITH TIME ZONE), ARRAY['c'])
 	`).Scan(
 		&goTime,
 		&nullTime,
@@ -336,7 +391,49 @@ func TestIntegrationTypeConversion(t *testing.T) {
 		&nullFloat64Slice3,
 		&goMap,
 		&nullMap,
+		&goRow,
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIntegrationArgsConversion(t *testing.T) {
+	dsn := *integrationServerFlag
+	dsn += "?session_properties=parse_decimal_literals_as_double=true"
+	db := integrationOpen(t, dsn)
+	value := 0
+	err := db.QueryRow(`
+		SELECT 1 FROM (VALUES (
+			CAST(1 AS TINYINT),
+			CAST(1 AS SMALLINT),
+			CAST(1 AS INTEGER),
+			CAST(1 AS BIGINT),
+			CAST(1 AS REAL),
+			CAST(1 AS DOUBLE),
+			TIMESTAMP '2017-07-10 01:02:03.004 UTC',
+			CAST('string' AS VARCHAR),
+			ARRAY['A', 'B']
+			)) AS t(col_tiny, col_small, col_int, col_big, col_real, col_double, col_ts, col_varchar, col_array )
+			WHERE 1=1
+			AND col_tiny = ?
+			AND col_small = ?
+			AND col_int = ?
+			AND col_big = ?
+			AND col_real = cast(? as real)
+			AND col_double = cast(? as double)
+			AND col_ts = ?
+			AND col_varchar = ?
+			AND col_array = ?`,
+		int16(1),
+		int16(1),
+		int32(1),
+		int64(1),
+		Numeric("1"),
+		Numeric("1"),
+		time.Date(2017, 7, 10, 1, 2, 3, 4*1000000, time.UTC),
+		"string",
+		[]string{"A", "B"}).Scan(&value)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -361,7 +458,7 @@ func TestIntegrationQueryParametersSelect(t *testing.T) {
 		name          string
 		query         string
 		args          []interface{}
-		expectedError bool
+		expectedError error
 		expectedRows  int
 	}{
 		{
@@ -380,13 +477,13 @@ func TestIntegrationQueryParametersSelect(t *testing.T) {
 			name:          "invalid string as bigint",
 			query:         "SELECT * FROM tpch.sf1.customer WHERE custkey=? LIMIT 2",
 			args:          []interface{}{"1"},
-			expectedError: true,
+			expectedError: errors.New(`trino: query failed (200 OK): "io.trino.spi.TrinoException: line 1:46: Cannot apply operator: bigint = varchar(1)"`),
 		},
 		{
 			name:          "valid string as date",
 			query:         "SELECT * FROM tpch.sf1.lineitem WHERE shipdate=? LIMIT 2",
 			args:          []interface{}{"1995-01-27"},
-			expectedError: true,
+			expectedError: errors.New(`trino: query failed (200 OK): "io.trino.spi.TrinoException: line 1:47: Cannot apply operator: date = varchar(10)"`),
 		},
 	}
 
@@ -399,16 +496,22 @@ func TestIntegrationQueryParametersSelect(t *testing.T) {
 
 			rows, err := db.Query(scenario.query, scenario.args...)
 			if err != nil {
-				if scenario.expectedError {
+				if scenario.expectedError == nil {
+					t.Errorf("Unexpected err: %s", err)
 					return
 				}
-				t.Fatal(err)
+				if err.Error() == scenario.expectedError.Error() {
+					return
+				}
+				t.Errorf("Expected err to be %s but got %s", scenario.expectedError, err)
 			}
-			defer rows.Close()
 
-			if scenario.expectedError {
-				t.Fatal("missing expected error")
+			if scenario.expectedError != nil {
+				t.Error("missing expected error")
+				return
 			}
+
+			defer rows.Close()
 
 			var count int
 			for rows.Next() {
@@ -418,7 +521,7 @@ func TestIntegrationQueryParametersSelect(t *testing.T) {
 				t.Fatal(err)
 			}
 			if count != scenario.expectedRows {
-				t.Fatalf("expecting %d rows, got %d", scenario.expectedRows, count)
+				t.Errorf("expecting %d rows, got %d", scenario.expectedRows, count)
 			}
 		})
 	}
@@ -459,7 +562,7 @@ func TestIntegrationExec(t *testing.T) {
 }
 
 func TestIntegrationUnsupportedHeader(t *testing.T) {
-	dsn := integrationServerDSN(t)
+	dsn := *integrationServerFlag
 	dsn += "?catalog=tpch&schema=sf10"
 	db := integrationOpen(t, dsn)
 	defer db.Close()
@@ -468,20 +571,12 @@ func TestIntegrationUnsupportedHeader(t *testing.T) {
 		err   error
 	}{
 		{
-			query: "SET SESSION grouped_execution=true",
-			err:   ErrUnsupportedHeader,
-		},
-		{
 			query: "SET ROLE dummy",
 			err:   errors.New(`trino: query failed (200 OK): "io.trino.spi.TrinoException: line 1:1: Role 'dummy' does not exist"`),
 		},
 		{
 			query: "SET PATH dummy",
 			err:   errors.New(`trino: query failed (200 OK): "io.trino.spi.TrinoException: SET PATH not supported by client"`),
-		},
-		{
-			query: "RESET SESSION grouped_execution",
-			err:   ErrUnsupportedHeader,
 		},
 	}
 	for _, c := range cases {
@@ -497,7 +592,7 @@ func TestIntegrationQueryContextCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dsn := integrationServerDSN(t)
+	dsn := *integrationServerFlag
 	dsn += "?catalog=tpch&schema=sf100&source=cancel-test&custom_client=uncompressed"
 	db := integrationOpen(t, dsn)
 	defer db.Close()
