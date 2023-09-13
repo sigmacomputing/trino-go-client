@@ -258,7 +258,7 @@ var (
 func newConn(dsn string) (*Conn, error) {
 	serverURL, err := url.Parse(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("trino: malformed dsn: %v", err)
+		return nil, fmt.Errorf("trino: malformed dsn: %w", err)
 	}
 
 	query := serverURL.Query()
@@ -270,13 +270,13 @@ func newConn(dsn string) (*Conn, error) {
 	if kerberosEnabled {
 		kt, err := keytab.Load(query.Get(kerberosKeytabPathConfig))
 		if err != nil {
-			return nil, fmt.Errorf("trino: Error loading Keytab: %v", err)
+			return nil, fmt.Errorf("trino: Error loading Keytab: %w", err)
 		}
 
 		kerberosClient = client.NewClientWithKeytab(query.Get(kerberosPrincipalConfig), query.Get(kerberosRealmConfig), kt)
 		conf, err := config.Load(query.Get(kerberosConfigPathConfig))
 		if err != nil {
-			return nil, fmt.Errorf("trino: Error loading krb config: %v", err)
+			return nil, fmt.Errorf("trino: Error loading krb config: %w", err)
 		}
 
 		kerberosClient.WithConfig(conf)
@@ -296,7 +296,7 @@ func newConn(dsn string) (*Conn, error) {
 	} else if certPath := query.Get(SSLCertPathConfig); certPath != "" && serverURL.Scheme == "https" {
 		cert, err := ioutil.ReadFile(certPath)
 		if err != nil {
-			return nil, fmt.Errorf("trino: Error loading SSL Cert File: %v", err)
+			return nil, fmt.Errorf("trino: Error loading SSL Cert File: %w", err)
 		}
 		certPool := x509.NewCertPool()
 		certPool.AppendCertsFromPEM(cert)
@@ -424,13 +424,13 @@ func (c *Conn) Close() error {
 func (c *Conn) newRequest(method, url string, body io.Reader, hs http.Header) (*http.Request, error) {
 	req, err := http.NewRequest(method, url, body)
 	if err != nil {
-		return nil, fmt.Errorf("trino: %v", err)
+		return nil, fmt.Errorf("trino: %w", err)
 	}
 
 	if c.kerberosEnabled {
 		err = c.kerberosClient.SetSPNEGOHeader(req, "trino/"+req.URL.Hostname())
 		if err != nil {
-			return nil, fmt.Errorf("error setting client SPNEGO header: %v", err)
+			return nil, fmt.Errorf("error setting client SPNEGO header: %w", err)
 		}
 	}
 
@@ -804,7 +804,7 @@ func (st *driverStmt) exec(ctx context.Context, args []driver.NamedValue) (*stmt
 	d.UseNumber()
 	err = d.Decode(&sr)
 	if err != nil {
-		return nil, fmt.Errorf("trino: %v", err)
+		return nil, fmt.Errorf("trino: %w", err)
 	}
 
 	st.doneCh = make(chan struct{})
@@ -859,7 +859,7 @@ func (st *driverStmt) exec(ctx context.Context, args []driver.NamedValue) (*stmt
 				d.UseNumber()
 				err = d.Decode(&qresp)
 				if err != nil {
-					st.errors <- fmt.Errorf("trino: %v", err)
+					st.errors <- fmt.Errorf("trino: %w", err)
 					return
 				}
 				err = resp.Body.Close()
