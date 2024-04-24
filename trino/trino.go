@@ -136,6 +136,7 @@ const (
 	kerberosRealmConfig      = "KerberosRealm"
 	kerberosConfigPathConfig = "KerberosConfigPath"
 	SSLCertPathConfig        = "SSLCertPath"
+	SSLCertConfig            = "SSLCert"
 )
 
 var (
@@ -172,6 +173,7 @@ type Config struct {
 	KerberosRealm      string            // The Kerberos Realm (optional)
 	KerberosConfigPath string            // The krb5 config path (optional)
 	SSLCertPath        string            // The SSL cert path for TLS verification (optional)
+	SSLCert            string            // The SSL cert for TLS verification (optional)
 	TimeZone           string            // The timezone for query processing (optional)
 }
 
@@ -203,8 +205,29 @@ func (c *Config) FormatDSN() (string, error) {
 	KerberosEnabled, _ := strconv.ParseBool(c.KerberosEnabled)
 	isSSL := serverURL.Scheme == "https"
 
-	if isSSL && c.SSLCertPath != "" {
+	if c.CustomClientName != "" {
+		if c.SSLCert != "" || c.SSLCertPath != "" {
+			return "", fmt.Errorf("trino: client configuration error, a custom client cannot be specific together with a custom SSL certificate")
+		}
+	}
+	if c.SSLCertPath != "" {
+		if !isSSL {
+			return "", fmt.Errorf("trino: client configuration error, SSL must be enabled to specify a custom SSL certificate file")
+		}
+		if c.SSLCert != "" {
+			return "", fmt.Errorf("trino: client configuration error, a custom SSL certificate file cannot be specified together with a certificate string")
+		}
 		query.Add(SSLCertPathConfig, c.SSLCertPath)
+	}
+
+	if c.SSLCert != "" {
+		if !isSSL {
+			return "", fmt.Errorf("trino: client configuration error, SSL must be enabled to specify a custom SSL certificate")
+		}
+		if c.SSLCertPath != "" {
+			return "", fmt.Errorf("trino: client configuration error, a custom SSL certificate string cannot be specified together with a certificate file")
+		}
+		query.Add(SSLCertConfig, c.SSLCert)
 	}
 
 	if KerberosEnabled {
@@ -293,20 +316,28 @@ func newConn(dsn string) (*Conn, error) {
 		if httpClient == nil {
 			return nil, fmt.Errorf("trino: custom client not registered: %q", clientKey)
 		}
-	} else if certPath := query.Get(SSLCertPathConfig); certPath != "" && serverURL.Scheme == "https" {
-		cert, err := ioutil.ReadFile(certPath)
-		if err != nil {
-			return nil, fmt.Errorf("trino: Error loading SSL Cert File: %w", err)
-		}
-		certPool := x509.NewCertPool()
-		certPool.AppendCertsFromPEM(cert)
+	} else if serverURL.Scheme == "https" {
 
-		httpClient = &http.Client{
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					RootCAs: certPool,
+		cert := []byte(query.Get(SSLCertConfig))
+
+		if certPath := query.Get(SSLCertPathConfig); certPath != "" {
+			cert, err = ioutil.ReadFile(certPath)
+			if err != nil {
+				return nil, fmt.Errorf("trino: Error loading SSL Cert File: %w", err)
+			}
+		}
+
+		if len(cert) != 0 {
+			certPool := x509.NewCertPool()
+			certPool.AppendCertsFromPEM(cert)
+
+			httpClient = &http.Client{
+				Transport: &http.Transport{
+					TLSClientConfig: &tls.Config{
+						RootCAs: certPool,
+					},
 				},
-			},
+			}
 		}
 	}
 
@@ -533,6 +564,11 @@ func (e *ErrQueryFailed) Error() string {
 		e.StatusCode, http.StatusText(e.StatusCode), e.Reason)
 }
 
+// Unwrap implements the unwrap interface.
+func (e *ErrQueryFailed) Unwrap() error {
+	return e.Reason
+}
+
 func newErrQueryFailedFromResponse(resp *http.Response) *ErrQueryFailed {
 	const maxBytes = 8 * 1024
 	defer resp.Body.Close()
@@ -629,6 +665,8 @@ func (st *driverStmt) ExecContext(ctx context.Context, args []driver.NamedValue)
 
 func (st *driverStmt) CheckNamedValue(arg *driver.NamedValue) error {
 	switch arg.Value.(type) {
+	case nil:
+		return nil
 	case Numeric, trinoDate, trinoTime, trinoTimeTz, trinoTimestamp:
 		return nil
 	default:
@@ -654,49 +692,72 @@ type stmtResponse struct {
 	InfoURI     string    `json:"infoUri"`
 	NextURI     string    `json:"nextUri"`
 	Stats       stmtStats `json:"stats"`
-	Error       stmtError `json:"error"`
+	Error       ErrTrino  `json:"error"`
 	UpdateType  string    `json:"updateType"`
 	UpdateCount int64     `json:"updateCount"`
 }
 
 type stmtStats struct {
-	State              string    `json:"state"`
-	Scheduled          bool      `json:"scheduled"`
-	Nodes              int       `json:"nodes"`
-	TotalSplits        int       `json:"totalSplits"`
-	QueuesSplits       int       `json:"queuedSplits"`
-	RunningSplits      int       `json:"runningSplits"`
-	CompletedSplits    int       `json:"completedSplits"`
-	UserTimeMillis     int       `json:"userTimeMillis"`
-	CPUTimeMillis      int       `json:"cpuTimeMillis"`
-	WallTimeMillis     int       `json:"wallTimeMillis"`
-	ProcessedRows      int       `json:"processedRows"`
-	ProcessedBytes     int       `json:"processedBytes"`
-	RootStage          stmtStage `json:"rootStage"`
-	ProgressPercentage float32   `json:"progressPercentage"`
+	State                string    `json:"state"`
+	Scheduled            bool      `json:"scheduled"`
+	Nodes                int       `json:"nodes"`
+	TotalSplits          int       `json:"totalSplits"`
+	QueuesSplits         int       `json:"queuedSplits"`
+	RunningSplits        int       `json:"runningSplits"`
+	CompletedSplits      int       `json:"completedSplits"`
+	UserTimeMillis       int       `json:"userTimeMillis"`
+	CPUTimeMillis        int64     `json:"cpuTimeMillis"`
+	WallTimeMillis       int64     `json:"wallTimeMillis"`
+	QueuedTimeMillis     int64     `json:"queuedTimeMillis"`
+	ElapsedTimeMillis    int64     `json:"elapsedTimeMillis"`
+	ProcessedRows        int64     `json:"processedRows"`
+	ProcessedBytes       int64     `json:"processedBytes"`
+	PhysicalInputBytes   int64     `json:"physicalInputBytes"`
+	PhysicalWrittenBytes int64     `json:"physicalWrittenBytes"`
+	PeakMemoryBytes      int64     `json:"peakMemoryBytes"`
+	SpilledBytes         int64     `json:"spilledBytes"`
+	RootStage            stmtStage `json:"rootStage"`
+	ProgressPercentage   float32   `json:"progressPercentage"`
+	RunningPercentage    float32   `json:"runningPercentage"`
 }
 
-type stmtError struct {
-	Message       string               `json:"message"`
-	ErrorName     string               `json:"errorName"`
-	ErrorCode     int                  `json:"errorCode"`
-	ErrorLocation stmtErrorLocation    `json:"errorLocation"`
-	FailureInfo   stmtErrorFailureInfo `json:"failureInfo"`
-	// Other fields omitted
+type ErrTrino struct {
+	Message       string        `json:"message"`
+	SqlState      string        `json:"sqlState"`
+	ErrorCode     int           `json:"errorCode"`
+	ErrorName     string        `json:"errorName"`
+	ErrorType     string        `json:"errorType"`
+	ErrorLocation ErrorLocation `json:"errorLocation"`
+	FailureInfo   FailureInfo   `json:"failureInfo"`
 }
 
-type stmtErrorLocation struct {
+func (i ErrTrino) Error() string {
+	return i.ErrorType + ": " + i.Message
+}
+
+type ErrorLocation struct {
 	LineNumber   int `json:"lineNumber"`
 	ColumnNumber int `json:"columnNumber"`
 }
 
-type stmtErrorFailureInfo struct {
-	Type string `json:"type"`
-	// Other fields omitted
+type FailureInfo struct {
+	Type          string        `json:"type"`
+	Message       string        `json:"message"`
+	Cause         *FailureInfo  `json:"cause"`
+	Suppressed    []FailureInfo `json:"suppressed"`
+	Stack         []string      `json:"stack"`
+	ErrorInfo     ErrorInfo     `json:"errorInfo"`
+	ErrorLocation ErrorLocation `json:"errorLocation"`
 }
 
-func (e stmtError) Error() string {
-	return e.FailureInfo.Type + ": " + e.Message
+type ErrorInfo struct {
+	Code int    `json:"code"`
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+func (i ErrorInfo) Error() string {
+	return fmt.Sprintf("%s: %s (%d)", i.Type, i.Name, i.Code)
 }
 
 type stmtStage struct {
@@ -1065,7 +1126,7 @@ type queryResponse struct {
 	Columns          []queryColumn `json:"columns"`
 	Data             []queryData   `json:"data"`
 	Stats            stmtStats     `json:"stats"`
-	Error            stmtError     `json:"error"`
+	Error            ErrTrino      `json:"error"`
 	UpdateType       string        `json:"updateType"`
 	UpdateCount      int64         `json:"updateCount"`
 }
@@ -1113,7 +1174,7 @@ type typeArgument struct {
 	long int64
 }
 
-func handleResponseError(status int, respErr stmtError) error {
+func handleResponseError(status int, respErr ErrTrino) error {
 	switch respErr.ErrorName {
 	case "":
 		return nil
@@ -1781,7 +1842,7 @@ func scanNullFloat64(v interface{}) (sql.NullFloat64, error) {
 	if ok {
 		vFloat, err := vNumber.Float64()
 		if err != nil {
-			return sql.NullFloat64{}, fmt.Errorf("cannot convert %v (%T) to float64", vNumber, vNumber)
+			return sql.NullFloat64{}, fmt.Errorf("cannot convert %v (%T) to float64: %w", vNumber, vNumber, err)
 		}
 		return sql.NullFloat64{Valid: true, Float64: vFloat}, nil
 	}
@@ -1793,7 +1854,15 @@ func scanNullFloat64(v interface{}) (sql.NullFloat64, error) {
 	case "-Infinity":
 		return sql.NullFloat64{Valid: true, Float64: math.Inf(-1)}, nil
 	default:
-		return sql.NullFloat64{}, fmt.Errorf("cannot convert %v (%T) to float64", v, v)
+		vString, ok := v.(string)
+		if !ok {
+			return sql.NullFloat64{}, fmt.Errorf("cannot convert %v (%T) to float64", v, v)
+		}
+		vFloat, err := strconv.ParseFloat(vString, 64)
+		if err != nil {
+			return sql.NullFloat64{}, fmt.Errorf("cannot convert %v (%T) to float64: %w", v, v, err)
+		}
+		return sql.NullFloat64{Valid: true, Float64: vFloat}, nil
 	}
 }
 
