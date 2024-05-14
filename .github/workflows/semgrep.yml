@@ -1,7 +1,10 @@
 name: Semgrep
 on:
-  pull_request:
-  workflow_dispatch:
+  push:
+     branches:
+          - varun-semgrep
+  #pull_request:
+  #workflow_dispatch:
 
 jobs:
   semgrep:
